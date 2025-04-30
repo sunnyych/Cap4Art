@@ -1,3 +1,4 @@
+# CLIP image encoder + classification head for emotion classification
 import os
 import pandas as pd
 from PIL import Image
@@ -6,21 +7,20 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-import timm
 from tqdm import tqdm
-from transformers import ViTConfig, ViTModel, AutoImageProcessor, ViTForImageClassification
+from transformers import CLIPModel, CLIPProcessor
 import wandb
+
 Image.LOAD_TRUNCATED_IMAGES = True
 
 # ===============================
 # Step 1: Load and Filter Dataset
 # ===============================
-# Load the dataset
 df_artemis_processed = pd.read_csv("artemis_images_with_links.csv")
 cache_dir = "/juice2/scr2/syu03"
+
 wandb.init(
-    project="vit-emotion-finetune_full",
+    project="clip-emotion-finetune_clip",
     config={
         "epochs": 30,
         "batch_size": 32,
@@ -28,28 +28,22 @@ wandb.init(
         "weight_decay": 0.01,
         "optimizer": "AdamW",
         "scheduler": "CosineAnnealingLR",
-        "model": "google/vit-base-patch16-224-in21k",
+        "model": "openai/clip-vit-base-patch32",
         "dataset": "artemis",
     }
 )
 
-
+img_dir = 'images/'
 def is_valid_image(path):
     try:
         img = Image.open(path)
-        img.verify()  # verify() is very lightweight, just checks file integrity
+        img.verify()
         return True
     except (IOError, SyntaxError):
         return False
 
-
-# Only keep rows that have a valid link and corresponding image exists
-img_dir = 'images/'
 df_artemis_processed['img_path'] = df_artemis_processed['painting'].apply(lambda x: os.path.join(img_dir, x + '.jpg'))
 df_artemis_processed = df_artemis_processed[df_artemis_processed['img_path'].apply(lambda x: os.path.exists(x) and is_valid_image(x))].reset_index(drop=True)
-# df_artemis_processed = df_artemis_processed[:1000]  # Limit to 1000 samples for testing
-
-# Define emotion -> class ID mapping
 
 EMOTION_LIST = [
     'amusement', 'anger', 'awe', 'contentment', 'disgust',
@@ -60,12 +54,10 @@ EMOTION2IDX = {emotion: idx for idx, emotion in enumerate(EMOTION_LIST)}
 # ============================
 # Step 2: Dataset and Dataloader
 # ============================
-
-# Custom Dataset
 class PaintingEmotionDataset(Dataset):
-    def __init__(self, df, image_processor):
+    def __init__(self, df, processor):
         self.data = df
-        self.processor = image_processor
+        self.processor = processor
 
     def __len__(self):
         return len(self.data)
@@ -75,149 +67,94 @@ class PaintingEmotionDataset(Dataset):
         image = Image.open(row['img_path']).convert("RGB")
         label = EMOTION2IDX[row['emotion']]
 
-        # Apply processor here
         processed = self.processor(images=image, return_tensors="pt")
-        pixel_values = processed['pixel_values'].squeeze(0)  # Remove batch dim
+        pixel_values = processed['pixel_values'].squeeze(0)
 
         return pixel_values, label
 
-# Define transforms
-train_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomRotation(10),
-    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-])
-
-val_test_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-])
-
 # ==========================
-# Step 3: Train/Val/Test Split
+# Step 3: Split
 # ==========================
+df_temp, df_test = train_test_split(df_artemis_processed, test_size=0.1, random_state=42, stratify=df_artemis_processed['emotion'])
+df_train, df_val = train_test_split(df_temp, test_size=0.2, random_state=42, stratify=df_temp['emotion'])
 
-# First split into train+val and test
-df_temp, df_test = train_test_split(
-    df_artemis_processed,
-    test_size=0.1,
-    random_state=42,
-    stratify=df_artemis_processed['emotion']
-)
+processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32", cache_dir=cache_dir)
 
-# Then split train+val into train and val
-df_train, df_val = train_test_split(
-    df_temp,
-    test_size=0.2,  # 20% of temp (~18% total)
-    random_state=42,
-    stratify=df_temp['emotion']
-)
+train_dataset = PaintingEmotionDataset(df_train, processor)
+val_dataset   = PaintingEmotionDataset(df_val, processor)
+test_dataset  = PaintingEmotionDataset(df_test, processor)
 
-# Create Dataset objects
-image_processor = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224-in21k", cache_dir=cache_dir)
-
-train_dataset = PaintingEmotionDataset(df_train, image_processor)
-val_dataset = PaintingEmotionDataset(df_val, image_processor)
-test_dataset = PaintingEmotionDataset(df_test, image_processor)
-
-# print the sizes of the datasets
-print(f"Train size: {len(train_dataset)}")
-print(f"Validation size: {len(val_dataset)}")
-print(f"Test size: {len(test_dataset)}")
-
-# Create Dataloaders
 train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
 val_loader   = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
 test_loader  = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
 
 # ==========================
-# Step 4: Model, Loss, Optimizer
+# Step 4: Model
 # ==========================
+class CLIPClassifier(nn.Module):
+    def __init__(self, clip_model, num_classes):
+        super().__init__()
+        self.vision_model = clip_model.vision_model
+        self.fc = nn.Linear(clip_model.config.vision_config.hidden_size, num_classes)
 
-# Device setup
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    def forward(self, pixel_values):
+        outputs = self.vision_model(pixel_values=pixel_values)
+        pooled_output = outputs.pooler_output
+        return self.fc(pooled_output)
 
-# Model
-# model = timm.create_model('swin_tiny_patch4_window7_224', cache_dir = cache_dir,pretrained=True, num_classes=len(EMOTION_LIST))
-# image_processor = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224-in21k")
-# model = ViTModel.from_pretrained("google/vit-base-patch16-224-in21k")
-model = ViTForImageClassification.from_pretrained(
-    "google/vit-base-patch16-224-in21k",
-    num_labels=len(EMOTION_LIST),
-    ignore_mismatched_sizes=True,  # Allows resizing the classification head
-    cache_dir=cache_dir
-)
-model.to(device)
+clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32", cache_dir=cache_dir)
+model = CLIPClassifier(clip_model, num_classes=len(EMOTION_LIST)).to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
 
-# Loss function
+# ==========================
+# Step 5: Training Setup
+# ==========================
 criterion = nn.CrossEntropyLoss()
-
-# Optimizer
 optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
-
-# Scheduler
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=30)
-
-# Paths
-save_dir = './checkpoints'
-os.makedirs(save_dir, exist_ok=True)
-best_model_path = os.path.join(save_dir, 'best_model.pth')
+save_dir = './checkpoints'; os.makedirs(save_dir, exist_ok=True)
+best_model_path = os.path.join(save_dir, 'best_model_clip.pth')
 
 # ==================
-# Step 5: Training Loop
+# Step 6: Training Loop
 # ==================
 
 best_val_acc = 0.0
 EPOCHS = 30
+device = next(model.parameters()).device
 
 for epoch in range(EPOCHS):
     model.train()
-    train_loss = 0.0
-    correct = 0
-    total = 0
+    train_loss, correct, total = 0.0, 0, 0
 
-    loop = tqdm(train_loader, desc=f"Epoch [{epoch+1}/{EPOCHS}]", leave=False)
-    for images, labels in loop:
+    for images, labels in tqdm(train_loader, desc=f"Epoch [{epoch+1}/{EPOCHS}]", leave=False):
         images, labels = images.to(device), labels.to(device)
 
         optimizer.zero_grad()
-        # outputs = model(images)
-        # loss = criterion(outputs, labels)
         outputs = model(images)
-        loss = criterion(outputs.logits, labels)
+        loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
 
-        # Metrics
         train_loss += loss.item()
-        _, predicted = outputs.logits.max(1)
+        _, predicted = outputs.max(1)
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
-
-        loop.set_postfix(loss=loss.item(), acc=100.*correct/total)
 
     train_acc = 100. * correct / total
     train_loss /= len(train_loader)
 
     # Validation
     model.eval()
-    val_loss = 0.0
-    val_correct = 0
-    val_total = 0
+    val_loss, val_correct, val_total = 0.0, 0, 0
 
     with torch.no_grad():
         for images, labels in val_loader:
             images, labels = images.to(device), labels.to(device)
-            # outputs = model(images)
-            # loss = criterion(outputs, labels)
             outputs = model(images)
-            loss = criterion(outputs.logits, labels)
+            loss = criterion(outputs, labels)
+
             val_loss += loss.item()
-            _, predicted = outputs.logits.max(1)
+            _, predicted = outputs.max(1)
             val_total += labels.size(0)
             val_correct += predicted.eq(labels).sum().item()
 
@@ -225,34 +162,21 @@ for epoch in range(EPOCHS):
     val_loss /= len(val_loader)
 
     print(f"Epoch [{epoch+1}/{EPOCHS}] | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}% | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}%")
-    wandb.log({
-    "epoch": epoch + 1,
-    "train_loss": train_loss,
-    "train_acc": train_acc,
-    "val_loss": val_loss,
-    "val_acc": val_acc
-})
+    wandb.log({"epoch": epoch+1, "train_loss": train_loss, "train_acc": train_acc, "val_loss": val_loss, "val_acc": val_acc})
 
-
-    # Save best model
     if val_acc > best_val_acc:
         best_val_acc = val_acc
         torch.save(model.state_dict(), best_model_path)
 
     scheduler.step()
 
-print(f"Training complete. Best Val Acc: {best_val_acc:.2f}%")
-
 # ==================
-# Step 6: Test the Best Model
+# Step 7: Test Evaluation
 # ==================
-
-print("🔎 Evaluating best model on test set...")
+print("\nEvaluating best model on test set...")
 model.load_state_dict(torch.load(best_model_path))
 model.eval()
-
-test_correct = 0
-test_total = 0
+test_correct, test_total = 0, 0
 
 with torch.no_grad():
     for images, labels in test_loader:
@@ -265,11 +189,3 @@ with torch.no_grad():
 test_acc = 100. * test_correct / test_total
 print(f"Test Accuracy: {test_acc:.2f}%")
 wandb.log({"test_acc": test_acc})
-
-
-
-
-
-
-
-   
