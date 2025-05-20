@@ -22,7 +22,8 @@ cache_dir = "/juice2/scr2/syu03"
 wandb.init(
     project="clip-emotion-finetune_clip",
     config={
-        "epochs": 30,
+        # "epochs": 30,
+        "epochs": 1,
         "batch_size": 32,
         "lr": 3e-4,
         "weight_decay": 0.01,
@@ -64,13 +65,32 @@ class PaintingEmotionDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.data.iloc[idx]
-        image = Image.open(row['img_path']).convert("RGB")
+
+        try:
+            image = Image.open(row['img_path'])
+
+            # Force proper mode
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+
+            # Force proper size
+            image = image.resize((224, 224))
+
+        except Exception as e:
+            print(f"[Warning] Skipping broken image at {row['img_path']}: {e}")
+            # Pick a random new index
+            new_idx = torch.randint(0, len(self.data), (1,)).item()
+            return self.__getitem__(new_idx)
+
         label = EMOTION2IDX[row['emotion']]
 
+        # Processor expects PIL Image (H,W,3), and will normalize it
         processed = self.processor(images=image, return_tensors="pt")
         pixel_values = processed['pixel_values'].squeeze(0)
 
         return pixel_values, label
+
+
 
 # ==========================
 # Step 3: Split
