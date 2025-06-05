@@ -1,12 +1,12 @@
 # Caption Evaluation with COCO Metrics
 
-This  script, `evaluate_captions.py`, is for evaluating generated image captions using MS COCO metrics such as **CIDEr**, **BLEU**, **METEOR**, and **ROUGE-L**.
+This  eval.ipynb is for evaluating generated image captions using MS COCO metrics such as **CIDEr**, **BLEU**, **METEOR**, and **ROUGE-L**.
 
 ---
 
 ## 📄 Contents
 
-- `evaluate_captions.py`: Evaluates generated captions against reference (ground-truth) captions using COCO metrics.
+- `eval.ipynb`: Evaluates generated captions against reference (ground-truth) captions using COCO eval tool.
 
 ---
 
